@@ -154,7 +154,7 @@ Ensures clean, human-friendly session logs.
 ### 1. Clone Repo
 
 ```bash
-git clone https://github.com/<your-repo>/hcmat.git
+git clone https://github.com/KilerMiler/H-CMAT.git
 cd hcmat
 ```
 
@@ -345,7 +345,7 @@ Fix:
 
 # ©️ **License**
 
-MIT or custom — your choice.
+Proprietary License - All Rights Reserved
 
 ***
 
