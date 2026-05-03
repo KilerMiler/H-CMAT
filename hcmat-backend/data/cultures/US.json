@@ -1,0 +1,8 @@
+{
+  "id": 3,
+  "code": "US",
+  "name": "American (Low-Context)",
+  "weights": { "speech": 0.55, "face": 0.25, "body": 0.20 },
+  "politeness_bias": 0.45,
+  "indirect_threshold": 0.35
+}

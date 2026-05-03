@@ -1,0 +1,29 @@
+frontend (deprecated)
+inference_engine v1 (deprecated)
+inference_engine v2 (deprecated)
+
+# Deprecated folders
+frontend/
+inference_engine v1/
+inference_engine v2/
+
+# Environments (Safety net for all subfolders)
+**/venv/
+**/.venv/
+**/env/
+node_modules/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+**/._*
+
+# Databases
+*.db
+*.sqlite3
+
+# Python/Build junk
+__pycache__/
+*.pyc
+dist/

@@ -1,0 +1,23 @@
+# ── Web framework ─────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0
+python-multipart>=0.0.9
+
+# ── Data validation ───────────────────────────────────────────────────────
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+
+# ── AI / ML ───────────────────────────────────────────────────────────────
+torch>=2.3.0               # MPS backend requires >=2.0
+transformers>=4.41.0       # DistilRoBERTa + Whisper pipelines
+numpy>=1.26.0
+
+# ── Vision ────────────────────────────────────────────────────────────────
+mediapipe>=0.10.14
+opencv-python>=4.9.0
+
+av>=12.0.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────
+# (sqlite3 is part of Python stdlib — no pip install needed)

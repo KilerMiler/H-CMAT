@@ -1,0 +1,149 @@
+/* src/features/EnvironmentalStressors/EnvironmentalStressors.module.css */
+
+.container {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.headerRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  letter-spacing: 1px;
+  font-weight: 600;
+}
+
+.stressorBlock {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition: opacity 0.3s ease;
+}
+
+/* Dim the text slightly when locked to emphasize the auto state */
+.stressorBlock.locked .label,
+.stressorBlock.locked .value {
+  color: var(--text-muted);
+}
+.stressorBlock.locked .value {
+  color: rgba(0, 255, 157, 0.5); /* Dimmer green */
+}
+
+.labelRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: var(--text-secondary);
+}
+
+.value {
+  font-size: 0.85rem;
+  font-family: monospace;
+  color: var(--accent-green);
+}
+
+.statusText {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  font-style: italic;
+  margin-top: -4px;
+}
+
+/* --- Toggle Switch Styling --- */
+.toggleContainer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background-color: rgba(0,0,0,0.2);
+  padding: 6px 12px;
+  border-radius: var(--radius-md);
+}
+
+.toggleLabel {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: var(--text-secondary);
+}
+
+.toggleSwitch {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  background-color: var(--bg-surface-hover);
+  border-radius: 20px;
+  cursor: pointer;
+  transition: background-color 0.3s;
+}
+
+.toggleSwitch.active {
+  background-color: rgba(0, 255, 157, 0.2);
+}
+
+.toggleKnob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  background-color: var(--text-muted);
+  border-radius: 50%;
+  transition: transform 0.3s, background-color 0.3s;
+}
+
+.toggleSwitch.active .toggleKnob {
+  transform: translateX(16px);
+  background-color: var(--accent-green);
+}
+
+/* --- Slider Styling --- */
+.slider {
+  -webkit-appearance: none;
+  width: 100%;
+  height: 6px;
+  border-radius: 4px;
+  outline: none;
+  transition: opacity 0.2s;
+}
+
+/* When active, show the thumb */
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent-green);
+  cursor: pointer;
+  box-shadow: 0 0 8px rgba(0, 255, 157, 0.4);
+  transition: transform 0.1s ease;
+}
+
+/* When disabled (Auto is ON), hide the thumb so it looks like a progress bar */
+.slider:disabled::-webkit-slider-thumb {
+  width: 0px;
+  height: 0px;
+  background: transparent;
+  box-shadow: none;
+  cursor: default;
+}
+
+.slider:disabled {
+  cursor: default;
+}

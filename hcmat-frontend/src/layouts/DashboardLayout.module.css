@@ -1,0 +1,67 @@
+/* src/layouts/DashboardLayout.module.css */
+.dashboard {
+  display: grid;
+  grid-template-rows: var(--header-height) 1fr;
+  height: 100vh;
+  background-color: var(--bg-root);
+  color: var(--text-primary);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  background-color: var(--bg-root);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.logo {
+  color: var(--accent-green);
+  font-weight: bold;
+  font-size: 1.25rem;
+  letter-spacing: 1px;
+}
+
+.headerMetrics {
+  display: flex;
+  gap: 24px;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.mainContent {
+  display: grid;
+  grid-template-columns: 4fr 5fr;
+  gap: 24px;
+  padding: 24px;
+  overflow: hidden; /* Locks the page, allows internal column scrolling */
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  overflow-y: auto;
+  padding-right: 8px; /* Room for scrollbar */
+}
+
+/* Custom, sleek scrollbar for the columns */
+.column::-webkit-scrollbar {
+  width: 6px;
+}
+.column::-webkit-scrollbar-track {
+  background: transparent;
+}
+.column::-webkit-scrollbar-thumb {
+  background: var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+/* A reusable class for all the "cards" or zones in the UI */
+.panel {
+  background-color: var(--bg-surface);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  border: 1px solid var(--border-subtle);
+}

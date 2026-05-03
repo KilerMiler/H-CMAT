@@ -1,0 +1,8 @@
+{
+  "id": 2,
+  "code": "JP",
+  "name": "Japanese (Collectivist)",
+  "weights": { "speech": 0.10, "face": 0.60, "body": 0.30 },
+  "politeness_bias": 0.92,
+  "indirect_threshold": 0.80
+}
