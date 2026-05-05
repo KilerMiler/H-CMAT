@@ -1,32 +1,16 @@
 /**
  * public/mediaWorker.js
  *
- * H-CMAT media encoding worker.
+ * Worker encodes audio WebM container as Data URL.
  *
- * Responsibility:
- *   - Receive WebM header chunk + rolling WebM chunks from main thread.
- *   - Stitch them into one WebM Blob.
- *   - Convert stitched Blob to FULL Data URL.
- *   - Send prepared WebSocket chunk payload back to main thread.
+ * Video is no longer taken from stitched WebM because rolling WebM stitching
+ * can become invalid for PyAV video decoding.
  *
- * Important:
- *   The backend expects either:
- *     1. Full Data URL:
- *        data:video/webm;codecs=vp8,opus;base64,AAAA...
- *
- *     2. Raw base64:
- *        AAAA...
- *
- *   We intentionally send FULL Data URL because it is easier to debug
- *   and backend can safely strip the prefix.
- *
- *   The same WebM container carries both video and audio tracks, so the same
- *   Data URL is sent as:
- *     - video_data_base64
- *     - audio_data_base64
+ * Main thread captures one JPEG frame from the live <video> element and passes
+ * it as meta.videoFrameDataUrl.
  */
 
-const WORKER_VERSION = 'mediaWorker-v3-dataurl-safe';
+const WORKER_VERSION = 'mediaWorker-v4-audio-webm-video-jpeg';
 
 function blobToDataUrl(blob) {
   const reader = new FileReaderSync();
@@ -55,7 +39,6 @@ function stitchBlobs(headerChunk, windowChunks) {
 
 self.onmessage = (event) => {
   const { type, payload } = event.data || {};
-
   if (type !== 'SEND_CHUNK') return;
 
   const { headerChunk, windowChunks, meta } = payload || {};
@@ -68,47 +51,30 @@ self.onmessage = (event) => {
     isFinalClip,
     textHistory,
     cultureId,
+    videoFrameDataUrl,
   } = meta || {};
 
   try {
-    if (!sessionId) {
-      throw new Error('Missing sessionId.');
-    }
+    if (!sessionId) throw new Error('Missing sessionId.');
+    if (seqId === undefined || seqId === null) throw new Error('Missing seqId.');
 
-    if (seqId === undefined || seqId === null) {
-      throw new Error('Missing seqId.');
-    }
+    const stitchedAudioVideoBlob = stitchBlobs(headerChunk, windowChunks);
+    const audioDataUrl = blobToDataUrl(stitchedAudioVideoBlob);
 
-    if (!headerChunk) {
-      throw new Error('Missing WebM header chunk.');
-    }
+    const safeVideoDataUrl =
+      typeof videoFrameDataUrl === 'string' &&
+      videoFrameDataUrl.startsWith('data:image/')
+        ? videoFrameDataUrl
+        : audioDataUrl;
 
-    if (!windowChunks || windowChunks.length === 0) {
-      throw new Error('No rolling window chunks available.');
-    }
-
-    const stitchedBlob = stitchBlobs(headerChunk, windowChunks);
-    const mediaDataUrl = blobToDataUrl(stitchedBlob);
-
-    if (
-      typeof mediaDataUrl !== 'string' ||
-      !mediaDataUrl.startsWith('data:') ||
-      !mediaDataUrl.includes('base64,')
-    ) {
-      throw new Error('Generated media Data URL is invalid.');
-    }
-
-    // Useful browser-side diagnostics.
-    // Check DevTools Console for these.
     console.log('[H-CMAT Worker] chunk ready', {
       workerVersion: WORKER_VERSION,
       seqId,
       isFinalClip,
-      stitchedSizeBytes: stitchedBlob.size,
-      blobType: stitchedBlob.type,
-      dataUrlPrefix: mediaDataUrl.slice(0, 80),
-      dataUrlLength: mediaDataUrl.length,
-      windowChunkCount: windowChunks.length,
+      audioBlobBytes: stitchedAudioVideoBlob.size,
+      audioDataUrlPrefix: audioDataUrl.slice(0, 60),
+      videoDataUrlPrefix: safeVideoDataUrl.slice(0, 60),
+      windowChunkCount: windowChunks?.length ?? 0,
     });
 
     const chunkPayload = {
@@ -124,11 +90,11 @@ self.onmessage = (event) => {
         culture_id: Number(cultureId) || 1,
         text_history: Array.isArray(textHistory) ? textHistory : [],
 
-        // Same WebM container includes audio + video.
-        // Backend decodes video frames from video_data_base64 and audio waveform
-        // from audio_data_base64 using PyAV.
-        audio_data_base64: mediaDataUrl,
-        video_data_base64: mediaDataUrl,
+        // Audio still comes from WebM container.
+        audio_data_base64: audioDataUrl,
+
+        // Video is now one reliable JPEG frame.
+        video_data_base64: safeVideoDataUrl,
       },
     };
 

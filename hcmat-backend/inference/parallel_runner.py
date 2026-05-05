@@ -26,6 +26,7 @@ import base64
 import binascii
 import io
 import re
+import cv2
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -146,12 +147,14 @@ def _safe_b64decode(b64_string: str) -> bytes:
 
 def _decode_webm_to_middle_frame(video_base64: str) -> np.ndarray:
     """
-    Decodes a browser WebM DataURL/base64 blob and returns the middle video
-    frame as a BGR numpy array.
+    Decodes visual payload into a BGR frame.
 
-    Returns:
-      BGR ndarray frame if decode succeeds.
-      Blank 480p frame if decode fails.
+    Supports:
+      - data:image/jpeg;base64,...
+      - data:image/png;base64,...
+      - data:video/webm;base64,...
+
+    Returns blank frame on failure.
     """
     blank = np.zeros((480, 640, 3), dtype=np.uint8)
 
@@ -165,14 +168,23 @@ def _decode_webm_to_middle_frame(video_base64: str) -> np.ndarray:
         )
         return blank
 
-    if not AV_AVAILABLE:
-        logger.warning("Video decode skipped because PyAV is unavailable.")
-        return blank
-
     try:
         raw_bytes = _safe_b64decode(video_base64)
 
-        logger.debug(f"[VideoDecoder] decoded bytes={len(raw_bytes)}")
+        logger.debug(f"[VisualDecoder] decoded bytes={len(raw_bytes)}")
+
+        # First try image decode. This handles JPEG/PNG camera frames.
+        arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+        if image is not None:
+            logger.debug(f"[VisualDecoder] decoded image shape={image.shape}")
+            return image
+
+        # If image decode failed, fallback to WebM video decode.
+        if not AV_AVAILABLE:
+            logger.warning("Video decode skipped because PyAV is unavailable.")
+            return blank
 
         container = av.open(io.BytesIO(raw_bytes))
         frames: List[np.ndarray] = []
@@ -196,9 +208,8 @@ def _decode_webm_to_middle_frame(video_base64: str) -> np.ndarray:
         return middle_frame
 
     except Exception as exc:
-        logger.error(f"Video decode failed: {exc}")
+        logger.error(f"Visual decode failed: {exc}")
         return blank
-
 
 def _decode_audio_to_waveform(audio_base64: str) -> Optional[dict[str, Any]]:
     """

@@ -9,10 +9,9 @@ All real-time traffic flows through this single connection:
     Frontend → Backend:  chunk, heartbeat
     Backend → Frontend:  matrix_update, fusion_result, attention_tick, error
 
-Current demo behavior:
-    The frontend may switch culture live by sending a different valid culture_id
-    in each FuseRequest. The backend strictly validates that culture_id before
-    applying its weights. Invalid IDs are rejected with a WebSocket error.
+This version includes the safety fix:
+    Dropping late fusion results if the session was already terminated
+    (prevents require() KeyError crashes).
 """
 
 from __future__ import annotations
@@ -39,10 +38,6 @@ router = APIRouter()
 
 
 async def _send(ws: WebSocket, msg_type: WSMessageType, payload: Any) -> None:
-    """
-    Serialises a WSMessage envelope and sends it over the WebSocket.
-    Send errors are swallowed so stale connections do not crash inference.
-    """
     try:
         if ws.client_state != WebSocketState.CONNECTED:
             return
@@ -61,26 +56,24 @@ async def _send_error(
     await _send(
         ws,
         WSMessageType.ERROR,
-        {"code": code, "message": message, "seq_id": seq_id},
+        {
+            "code": code,
+            "message": message,
+            "seq_id": seq_id,
+        },
     )
 
 
 @router.websocket("/stream/{session_id}")
 async def stream_endpoint(websocket: WebSocket, session_id: str):
-    """
-    Persistent bidirectional WebSocket for the entire session duration.
-
-    Opened after POST /api/v1/inference/session returns a valid session_id.
-    Closed when the user clicks Stop or when the browser connection drops.
-    """
     system = websocket.app.state.system
     session_manager = system["session_manager"]
     runner = system["runner"]
     fusion_layer = system["brain"]
     mapper = system["mapper"]
 
-    session = session_manager.get(session_id)
-    if session is None:
+    # Validate session exists
+    if session_manager.get(session_id) is None:
         await websocket.close(code=4004, reason=f"Session '{session_id}' not found.")
         logger.warning(f"WS rejected — unknown session: {session_id}")
         return
@@ -92,6 +85,7 @@ async def stream_endpoint(websocket: WebSocket, session_id: str):
         while True:
             raw = await websocket.receive_text()
 
+            # Parse JSON
             try:
                 data = json.loads(raw)
                 msg_type = data.get("type")
@@ -100,13 +94,23 @@ async def stream_endpoint(websocket: WebSocket, session_id: str):
                 await _send_error(websocket, "PARSE_ERROR", "Invalid JSON frame.")
                 continue
 
+            # Heartbeat
             if msg_type == WSMessageType.HEARTBEAT:
-                logger.debug(f"[{session_id}] Heartbeat received.")
                 continue
 
+            # Main message: CHUNK
             if msg_type == WSMessageType.CHUNK:
                 pipeline_start = time.time()
 
+                # Check session still exists (prevent late crashes)
+                active_session = session_manager.get(session_id)
+                if active_session is None:
+                    logger.warning(
+                        f"[{session_id}] Received chunk after session termination — dropping."
+                    )
+                    break
+
+                # Validate FuseRequest schema
                 try:
                     fuse_req = FuseRequest(**payload)
                 except Exception as exc:
@@ -114,50 +118,71 @@ async def stream_endpoint(websocket: WebSocket, session_id: str):
                         websocket,
                         "SCHEMA_ERROR",
                         f"FuseRequest validation failed: {exc}",
-                        seq_id=payload.get("seq_id"),
+                        payload.get("seq_id"),
                     )
                     continue
 
+                # session_id mismatch
                 if fuse_req.session_id != session_id:
                     await _send_error(
                         websocket,
                         "SESSION_MISMATCH",
                         (
                             f"Payload session_id '{fuse_req.session_id}' does not "
-                            f"match path session_id '{session_id}'."
+                            f"match WebSocket session_id '{session_id}'."
                         ),
-                        seq_id=fuse_req.seq_id,
+                        fuse_req.seq_id,
                     )
                     continue
 
-                # Strict culture validation.
-                # This keeps live culture switching possible while preventing
-                # silent fallback to the wrong profile.
+                # Culture validation
                 if not mapper.has_id(fuse_req.culture_id):
                     await _send_error(
                         websocket,
                         "UNKNOWN_CULTURE",
                         (
                             f"Cultural profile {fuse_req.culture_id} not found. "
-                            f"Available IDs: {mapper.available_ids()}"
+                            f"Available: {mapper.available_ids()}"
                         ),
-                        seq_id=fuse_req.seq_id,
+                        fuse_req.seq_id,
                     )
                     continue
 
-                if not session_manager.is_seq_valid(session_id, fuse_req.seq_id):
-                    continue
+                # Sequence validity check
+                try:
+                    if not session_manager.is_seq_valid(session_id, fuse_req.seq_id):
+                        continue
+                except KeyError:
+                    logger.warning(
+                        f"[{session_id}] Session terminated during seq check — dropping chunk."
+                    )
+                    break
 
-                session_manager.update_text_history(session_id, fuse_req.text_history)
+                # Update text history
+                try:
+                    session_manager.update_text_history(
+                        session_id, fuse_req.text_history
+                    )
+                except KeyError:
+                    logger.warning(
+                        f"[{session_id}] Session terminated during text update — dropping chunk."
+                    )
+                    break
 
-                # Keep session metadata synced with live frontend culture selection.
-                # This is useful for the final SQLite log.
-                session = session_manager.require(session_id)
-                session.culture_id = fuse_req.culture_id
+                # Sync culture ID
+                active_session = session_manager.get(session_id)
+                if active_session is None:
+                    logger.warning(
+                        f"[{session_id}] Session terminated before culture sync — dropping chunk."
+                    )
+                    break
+
+                active_session.culture_id = fuse_req.culture_id
 
                 text_input = fuse_req.text_history[-1] if fuse_req.text_history else ""
                 culture_weights = mapper.get_weights_for_fusion(fuse_req.culture_id)
 
+                # Run encoders
                 try:
                     encoder_outputs = await runner.run_all_async(
                         text_input=text_input,
@@ -165,18 +190,24 @@ async def stream_endpoint(websocket: WebSocket, session_id: str):
                         video_base64=fuse_req.video_data_base64,
                     )
                 except Exception as exc:
-                    logger.error(
-                        f"[{session_id}] Encoder stage crashed: {exc}",
-                        exc_info=True,
-                    )
+                    logger.error(f"[{session_id}] Encoder crashed: {exc}", exc_info=True)
                     await _send_error(
                         websocket,
                         "INFERENCE_ERROR",
-                        f"H-CMAT encoder pipeline error: {exc}",
-                        seq_id=fuse_req.seq_id,
+                        f"Encoder failure: {exc}",
+                        fuse_req.seq_id,
                     )
                     continue
 
+                # Session may be deleted during slow encoder
+                active_session = session_manager.get(session_id)
+                if active_session is None:
+                    logger.warning(
+                        f"[{session_id}] Session terminated before fusion — dropping late result."
+                    )
+                    break
+
+                # Run fusion
                 try:
                     fuse_response = fusion_layer.fuse(
                         encoder_outputs=encoder_outputs,
@@ -186,55 +217,66 @@ async def stream_endpoint(websocket: WebSocket, session_id: str):
                         pipeline_start=pipeline_start,
                     )
                 except Exception as exc:
-                    logger.error(
-                        f"[{session_id}] Fusion crashed: {exc}",
-                        exc_info=True,
-                    )
+                    logger.error(f"[{session_id}] Fusion crashed: {exc}", exc_info=True)
                     await _send_error(
                         websocket,
                         "FUSION_ERROR",
-                        f"H-CMAT fusion error: {exc}",
-                        seq_id=fuse_req.seq_id,
+                        f"Fusion failure: {exc}",
+                        fuse_req.seq_id,
                     )
                     continue
 
-                matrix_update = MatrixUpdateResponse(
-                    seq_id=fuse_req.seq_id,
-                    modality_matrix=fuse_response.modality_matrix,
-                )
+                # Session may terminate right after fusion
+                active_session = session_manager.get(session_id)
+                if active_session is None:
+                    logger.warning(
+                        f"[{session_id}] Session terminated after fusion — dropping late result."
+                    )
+                    break
+
+                # Send MATRIX_UPDATE
                 await _send(
                     websocket,
                     WSMessageType.MATRIX_UPDATE,
-                    matrix_update.model_dump(),
+                    MatrixUpdateResponse(
+                        seq_id=fuse_req.seq_id,
+                        modality_matrix=fuse_response.modality_matrix,
+                    ).model_dump(),
                 )
 
-                weights = {
-                    k: v.weight for k, v in fuse_response.modality_matrix.items()
-                }
+                # Send ATTENTION_TICK
+                weights = {k: v.weight for k, v in fuse_response.modality_matrix.items()}
+                cross = {}
                 keys = list(weights.keys())
-                cross_weights: Dict[str, float] = {}
-
                 for i in range(len(keys)):
                     for j in range(len(keys)):
                         if i != j:
-                            label = f"{keys[i]}_to_{keys[j]}"
-                            cross_weights[label] = round(
-                                weights[keys[i]] * weights[keys[j]],
-                                4,
+                            cross[f"{keys[i]}_to_{keys[j]}"] = round(
+                                weights[keys[i]] * weights[keys[j]], 4
                             )
 
-                attention_tick = AttentionTickResponse(
-                    ts=int(time.time() * 1000),
-                    weights=cross_weights,
-                )
                 await _send(
                     websocket,
                     WSMessageType.ATTENTION_TICK,
-                    attention_tick.model_dump(),
+                    AttentionTickResponse(
+                        ts=int(time.time() * 1000),
+                        weights=cross,
+                    ).model_dump(),
                 )
 
-                apply_nms(session_manager.require(session_id), fuse_response)
+                # SAFE NMS:
+                # ---------------------------------------
+                active_session = session_manager.get(session_id)
+                if active_session is None:
+                    logger.warning(
+                        f"[{session_id}] Session terminated before NMS — dropping late result."
+                    )
+                    break
 
+                apply_nms(active_session, fuse_response)
+                # ---------------------------------------
+
+                # Send FUSION_RESULT
                 await _send(
                     websocket,
                     WSMessageType.FUSION_RESULT,
@@ -243,23 +285,29 @@ async def stream_endpoint(websocket: WebSocket, session_id: str):
 
                 logger.info(
                     f"[{session_id}] seq={fuse_req.seq_id} "
-                    f"culture={fuse_req.culture_id} "
                     f"intent='{fuse_response.holistic_fusion.primary_intent}' "
-                    f"is_new={fuse_response.holistic_fusion.is_new_event} "
-                    f"replace_seq={fuse_response.holistic_fusion.replaces_seq_id} "
+                    f"new={fuse_response.holistic_fusion.is_new_event} "
+                    f"replace={fuse_response.holistic_fusion.replaces_seq_id} "
                     f"total={fuse_response.total_latency_ms}ms"
                 )
 
+                # Final clip
                 if fuse_req.temporal_context.is_final_clip:
-                    session_manager.require(session_id).status = "summarize_ready"
-                    logger.info(
-                        f"[{session_id}] Final clip received. "
-                        "Session ready for POST /summarize."
-                    )
+                    active_session = session_manager.get(session_id)
+                    if active_session:
+                        active_session.status = "summarize_ready"
+                        logger.info(
+                            f"[{session_id}] Final clip received — ready for /summarize."
+                        )
+                    else:
+                        logger.warning(
+                            f"[{session_id}] Final clip arrived after session termination."
+                        )
+                    break
 
                 continue
 
-            logger.warning(f"[{session_id}] Unknown message type: {msg_type}")
+            # Unknown message
             await _send_error(
                 websocket,
                 "UNKNOWN_TYPE",
@@ -267,7 +315,7 @@ async def stream_endpoint(websocket: WebSocket, session_id: str):
             )
 
     except WebSocketDisconnect:
-        logger.info(f"[{session_id}] WebSocket disconnected by client.")
+        logger.info(f"[{session_id}] WebSocket disconnected.")
 
     except Exception as exc:
         logger.error(f"[{session_id}] WebSocket crashed: {exc}", exc_info=True)

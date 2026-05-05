@@ -5,8 +5,17 @@
  *   - camera/mic stream
  *   - MediaRecorder
  *   - WebSocket
- *   - rolling 4s WebM window
- *   - Web Worker base64 encoding
+ *   - rolling 4s WebM audio window
+ *   - live JPEG video frame capture
+ *   - Web Worker media encoding
+ *
+ * Current streaming strategy:
+ *   - Audio is sent as stitched WebM Data URL.
+ *   - Video is sent as one JPEG Data URL captured from the live <video> element.
+ *
+ * Why:
+ *   Rolling WebM chunks can become unreliable for video decoding.
+ *   JPEG frame snapshots are stable for MediaPipe Face/Pose/Hands.
  */
 
 import React, { useRef, useCallback, useState, useEffect } from 'react';
@@ -26,8 +35,15 @@ function wait(ms) {
 
 function waitForWsOpen(ws, timeoutMs = 3000) {
   return new Promise((resolve, reject) => {
-    if (!ws) return reject(new Error('WebSocket missing.'));
-    if (ws.readyState === WebSocket.OPEN) return resolve();
+    if (!ws) {
+      reject(new Error('WebSocket missing.'));
+      return;
+    }
+
+    if (ws.readyState === WebSocket.OPEN) {
+      resolve();
+      return;
+    }
 
     const started = Date.now();
 
@@ -35,11 +51,13 @@ function waitForWsOpen(ws, timeoutMs = 3000) {
       if (ws.readyState === WebSocket.OPEN) {
         clearInterval(timer);
         resolve();
+        return;
       }
 
       if (ws.readyState === WebSocket.CLOSED) {
         clearInterval(timer);
         reject(new Error('WebSocket closed before opening.'));
+        return;
       }
 
       if (Date.now() - started > timeoutMs) {
@@ -50,17 +68,52 @@ function waitForWsOpen(ws, timeoutMs = 3000) {
   });
 }
 
+/**
+ * Captures one stable JPEG frame from the live webcam preview.
+ *
+ * This replaces WebM video decoding for visual encoders because stitched WebM
+ * rolling windows can become invalid for PyAV video decoding.
+ */
+function captureVideoFrameDataUrl(videoEl) {
+  if (!videoEl || videoEl.readyState < 2) {
+    return null;
+  }
+
+  const width = videoEl.videoWidth || 640;
+  const height = videoEl.videoHeight || 480;
+
+  if (!width || !height) {
+    return null;
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+
+  const ctx = canvas.getContext('2d');
+
+  if (!ctx) {
+    return null;
+  }
+
+  ctx.drawImage(videoEl, 0, 0, width, height);
+
+  return canvas.toDataURL('image/jpeg', 0.75);
+}
+
 export default function MultimodalFeed() {
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const wsRef = useRef(null);
   const recorderRef = useRef(null);
   const workerRef = useRef(null);
+
   const headerRef = useRef(null);
   const bufferRef = useRef([]);
   const seqRef = useRef(0);
   const intervalRef = useRef(null);
   const pendingSendsRef = useRef(new Map());
+  const recordingStartRef = useRef(null);
 
   const [cameraError, setCameraError] = useState(null);
 
@@ -82,8 +135,9 @@ export default function MultimodalFeed() {
   /**
    * Important:
    * Do not feed previous predicted intents back as user text.
-   * Backend audio encoder now gets the actual WebM audio stream.
-   * If later you add a text input box, return last typed utterances here.
+   * Backend audio encoder receives the actual WebM audio stream.
+   *
+   * Later, if you add a text input box, return last typed utterances here.
    */
   const getTextHistory = useCallback(() => [], []);
 
@@ -110,10 +164,15 @@ export default function MultimodalFeed() {
 
           ws.send(JSON.stringify(chunkPayload));
 
-          if (pending) pending.resolve();
+          if (pending) {
+            pending.resolve();
+          }
         } catch (err) {
           console.error('[Worker→WS] Send failed:', err);
-          if (pending) pending.reject(err);
+
+          if (pending) {
+            pending.reject(err);
+          }
         } finally {
           pendingSendsRef.current.delete(seqId);
         }
@@ -140,54 +199,67 @@ export default function MultimodalFeed() {
     workerRef.current = worker;
   }, [pushWsError]);
 
-  const openWs = useCallback(
-    (sid) => {
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+  const openWs = useCallback((sid) => {
+    if (wsRef.current) {
+      wsRef.current.close();
+    }
 
-      const ws = new WebSocket(`${WS_BASE}/stream/${sid}`);
+    const ws = new WebSocket(`${WS_BASE}/stream/${sid}`);
 
-      ws.onopen = () => console.log('[WS] Connected');
+    ws.onopen = () => {
+      console.log('[WS] Connected');
+    };
 
-      ws.onclose = (event) => {
-        console.log('[WS] Closed', event.code, event.reason);
-      };
+    ws.onclose = (event) => {
+      console.log('[WS] Closed', event.code, event.reason);
+    };
 
-      ws.onerror = (e) => {
-        console.error('[WS] Error', e);
-      };
+    ws.onerror = (event) => {
+      console.error('[WS] Error', event);
+    };
 
-      ws.onmessage = (e) => {
-        try {
-          const { type, payload } = JSON.parse(e.data);
-          const store = useDashboardStore.getState();
+    ws.onmessage = (event) => {
+      try {
+        const { type, payload } = JSON.parse(event.data);
+        const store = useDashboardStore.getState();
 
-          if (type === 'matrix_update') store.applyMatrixUpdate(payload);
-          if (type === 'fusion_result') store.applyFusionResult(payload);
-          if (type === 'attention_tick') store.applyAttentionTick(payload);
-          if (type === 'error') {
-            console.warn('[WS] Backend error:', payload);
-            store.pushWsError(payload);
-          }
-        } catch (err) {
-          console.warn('[WS] Bad message:', err);
+        if (type === 'matrix_update') {
+          store.applyMatrixUpdate(payload);
         }
-      };
 
-      wsRef.current = ws;
-      return ws;
-    },
-    []
-  );
+        if (type === 'fusion_result') {
+          store.applyFusionResult(payload);
+        }
+
+        if (type === 'attention_tick') {
+          store.applyAttentionTick(payload);
+        }
+
+        if (type === 'error') {
+          console.warn('[WS] Backend error:', payload);
+          store.pushWsError(payload);
+        }
+      } catch (err) {
+        console.warn('[WS] Bad message:', err);
+      }
+    };
+
+    wsRef.current = ws;
+    return ws;
+  }, []);
 
   const dispatch = useCallback(
     async (sid, isFinal = false) => {
       const header = headerRef.current;
       const buffer = bufferRef.current;
 
-      if (!sid) return;
-      if (!header || buffer.length === 0) return;
+      if (!sid) {
+        return;
+      }
+
+      if (!header || buffer.length === 0) {
+        return;
+      }
 
       const ws = wsRef.current;
 
@@ -196,27 +268,48 @@ export default function MultimodalFeed() {
         return;
       }
 
+      const worker = workerRef.current;
+
+      if (!worker) {
+        console.warn('[Dispatch] Worker not ready; skipping chunk.');
+        return;
+      }
+
       const windowChunks = buffer.slice(-WINDOW_CHUNKS);
       const firstChunk = windowChunks[0];
       const lastChunk = windowChunks[windowChunks.length - 1];
 
-      const baseStart = sessionStart ?? Date.now();
+      if (!firstChunk || !lastChunk) {
+        return;
+      }
+
+      const baseStart = recordingStartRef.current ?? sessionStart ?? Date.now();
 
       const clipStartMs = Math.max(0, firstChunk.arrivedAt - baseStart);
 
-      // Add 1s because arrivedAt is when the MediaRecorder chunk was emitted.
+      /**
+       * arrivedAt is when MediaRecorder emitted the chunk.
+       * Add 1 second to represent the approximate end of the last recorded chunk.
+       */
       const clipEndMs = Math.max(
-        clipStartMs + 1,
+        clipStartMs + CHUNK_INTERVAL_MS,
         lastChunk.arrivedAt - baseStart + CHUNK_INTERVAL_MS
       );
 
       const seqId = seqRef.current++;
 
+      /**
+       * Stable visual payload:
+       * Capture one JPEG frame from live camera.
+       * Worker will send this as video_data_base64.
+       */
+      const videoFrameDataUrl = captureVideoFrameDataUrl(videoRef.current);
+
       const sendPromise = new Promise((resolve, reject) => {
         pendingSendsRef.current.set(seqId, { resolve, reject });
       });
 
-      workerRef.current?.postMessage({
+      worker.postMessage({
         type: 'SEND_CHUNK',
         payload: {
           headerChunk: header,
@@ -229,6 +322,7 @@ export default function MultimodalFeed() {
             isFinalClip: isFinal,
             textHistory: getTextHistory(),
             cultureId,
+            videoFrameDataUrl,
           },
         },
       });
@@ -270,7 +364,7 @@ export default function MultimodalFeed() {
     const sid = await startSession();
 
     if (!sid) {
-      stream.getTracks().forEach((t) => t.stop());
+      stream.getTracks().forEach((track) => track.stop());
 
       if (videoRef.current) {
         videoRef.current.srcObject = null;
@@ -288,7 +382,13 @@ export default function MultimodalFeed() {
     } catch (err) {
       console.error('[WS] Could not open:', err);
       alert(`Could not open WebSocket:\n${err.message}`);
-      stream.getTracks().forEach((t) => t.stop());
+
+      stream.getTracks().forEach((track) => track.stop());
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+      }
+
       return;
     }
 
@@ -296,6 +396,7 @@ export default function MultimodalFeed() {
     bufferRef.current = [];
     seqRef.current = 0;
     pendingSendsRef.current.clear();
+    recordingStartRef.current = Date.now();
 
     const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')
       ? 'video/webm;codecs=vp8,opus'
@@ -304,16 +405,22 @@ export default function MultimodalFeed() {
     const recorder = new MediaRecorder(stream, { mimeType });
     recorderRef.current = recorder;
 
-    recorder.ondataavailable = (e) => {
-      if (!e.data || e.data.size === 0) return;
+    recorder.ondataavailable = (event) => {
+      if (!event.data || event.data.size === 0) {
+        return;
+      }
 
+      /**
+       * First MediaRecorder blob usually contains the WebM codec/container header.
+       * Store it permanently and prepend it to rolling audio chunks in worker.
+       */
       if (headerRef.current === null) {
-        headerRef.current = e.data;
+        headerRef.current = event.data;
         return;
       }
 
       bufferRef.current.push({
-        blob: e.data,
+        blob: event.data,
         arrivedAt: Date.now(),
       });
 
@@ -324,19 +431,26 @@ export default function MultimodalFeed() {
 
     recorder.start(CHUNK_INTERVAL_MS);
 
+    /**
+     * Wait 2 seconds before first dispatch so buffer has enough chunks.
+     */
     setTimeout(() => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
 
       intervalRef.current = setInterval(() => {
-        dispatch(sid, false).catch((err) =>
-          console.warn('[Dispatch] Chunk failed:', err)
-        );
+        dispatch(sid, false).catch((err) => {
+          console.warn('[Dispatch] Chunk failed:', err);
+        });
       }, STRIDE_MS);
     }, STRIDE_MS);
   }, [startSession, initWorker, openWs, dispatch]);
 
   const handleStop = useCallback(async () => {
-    if (!sessionId) return;
+    if (!sessionId) {
+      return;
+    }
 
     setSessionStatus('stopping');
 
@@ -344,10 +458,14 @@ export default function MultimodalFeed() {
     intervalRef.current = null;
 
     try {
-      // Send final clip and wait until it is actually written to WS.
+      /**
+       * Send final clip and wait until it is actually written to WebSocket.
+       */
       await dispatch(sessionId, true);
 
-      // Give backend time to process final inference_result before summarize.
+      /**
+       * Give backend time to finish final inference before summarize.
+       */
       await wait(1800);
     } catch (err) {
       console.warn('[Stop] Final clip failed:', err);
@@ -355,9 +473,11 @@ export default function MultimodalFeed() {
 
     try {
       recorderRef.current?.stop();
-    } catch {}
+    } catch {
+      // Ignore MediaRecorder stop errors during teardown.
+    }
 
-    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current?.getTracks().forEach((track) => track.stop());
 
     if (videoRef.current) {
       videoRef.current.srcObject = null;
@@ -374,15 +494,20 @@ export default function MultimodalFeed() {
     headerRef.current = null;
     bufferRef.current = [];
     recorderRef.current = null;
+    recordingStartRef.current = null;
     pendingSendsRef.current.clear();
   }, [sessionId, dispatch, setSessionStatus, stopSession]);
 
   useEffect(() => {
     return () => {
       clearInterval(intervalRef.current);
-      streamRef.current?.getTracks().forEach((t) => t.stop());
+
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+
       wsRef.current?.close();
+
       workerRef.current?.terminate();
+
       pendingSendsRef.current.clear();
     };
   }, []);
@@ -397,16 +522,25 @@ export default function MultimodalFeed() {
           <div
             className={`${styles.dot} ${isActive ? styles.dotActive : ''}`}
           />
+
           {isActive ? 'LIVE MULTIMODAL FEED' : 'MULTIMODAL FEED — STANDBY'}
         </div>
 
         <div className={styles.channel}>
-          {sessionId ? `SID_${sessionId.slice(-6).toUpperCase()}` : 'CH_01_INPUT'}
+          {sessionId
+            ? `SID_${sessionId.slice(-6).toUpperCase()}`
+            : 'CH_01_INPUT'}
         </div>
       </div>
 
       <div className={styles.videoWrapper}>
-        <video ref={videoRef} autoPlay playsInline muted className={styles.video} />
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          className={styles.video}
+        />
 
         {!isActive && (
           <div className={styles.idleOverlay}>
@@ -427,6 +561,7 @@ export default function MultimodalFeed() {
               <span className={styles.label}>FACE: {faceFeature}</span>
               <span className={styles.label}>BODY: {bodyFeature}</span>
             </div>
+
             <div className={styles.scanline} />
           </>
         )}
